@@ -1,0 +1,5 @@
+password: ""
+repo_path: "./myrepo"
+watch_path: "./watched_directory"
+remote_url: "git@github.com:username/myrepo.git"
+

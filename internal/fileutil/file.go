@@ -1,6 +1,7 @@
 package fileutils
 
 import (
+	"fmt"
 	"git-fs/internal/crypto"
 	"io/fs"
 	"os"
@@ -52,4 +53,12 @@ func ReadOrCreateSalt(path string) ([]byte, error) {
 	}
 	err = WriteFileAtomic(path, salt, 0644)
 	return salt, err
+}
+
+func SafeReadFile(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file %q: %w", path, err)
+	}
+	return data, nil
 }
