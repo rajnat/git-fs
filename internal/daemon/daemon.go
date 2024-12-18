@@ -12,6 +12,7 @@ import (
 	fileutils "git-fs/internal/fileutil"
 	"git-fs/internal/gitutils"
 	"git-fs/internal/logging"
+	"git-fs/internal/status"
 
 	"github.com/fsnotify/fsnotify"
 	"go.uber.org/zap"
@@ -49,6 +50,11 @@ func RunDaemon(cfg *config.Config) error {
 		logger.Error("Failed to add watch path", zap.String("watchPath", cfg.WatchPath), zap.Error(err))
 		return errors.New("could not watch the specified directory; please check if it exists and is accessible")
 	}
+	st := &status.Status{
+		WatcherRunning: true,
+	}
+	statusPath := filepath.Join(cfg.RepoPath, ".status.json")
+	status.SaveStatus(statusPath, st)
 
 	cs := &changeSet{files: make(map[string]struct{})}
 
@@ -107,7 +113,7 @@ func RunDaemon(cfg *config.Config) error {
 
 			if len(changedFiles) > 0 {
 				logger.Info("Processing changes", zap.Int("file_count", len(changedFiles)))
-				if err := handleChanges(cfg, key, changedFiles); err != nil {
+				if err := handleChanges(cfg, key, changedFiles, st, statusPath); err != nil {
 					logger.Error("Failed to handle changes", zap.Error(err))
 				}
 			}
@@ -118,9 +124,14 @@ func RunDaemon(cfg *config.Config) error {
 	return nil
 }
 
-func handleChanges(cfg *config.Config, key []byte, changedFiles []string) error {
+func handleChanges(cfg *config.Config, key []byte, changedFiles []string, st *status.Status, statusPath string) error {
 	logger := logging.Logger
 	encryptedRoot := filepath.Join(cfg.RepoPath, ".encrypted")
+	// all changes have to be in pending before encryption -> commit -> push
+	st.FilesPending = len(changedFiles)
+	if err := status.SaveStatus(statusPath, st); err != nil {
+		logger.Warn("Failed to save status before encryption", zap.Error(err))
+	}
 
 	for _, f := range changedFiles {
 		fileInfo, err := fileutils.SafeStat(f)
@@ -136,6 +147,9 @@ func handleChanges(cfg *config.Config, key []byte, changedFiles []string) error 
 						zap.String("path", encPath))
 				}
 			}
+			// Reduce pending since one file effectively doesn't need encryption now
+			st.FilesPending -= 1
+			status.SaveStatus(statusPath, st)
 			continue
 		}
 
@@ -146,6 +160,9 @@ func handleChanges(cfg *config.Config, key []byte, changedFiles []string) error 
 				logger.Error("Failed to ensure directory",
 					zap.String("path", filepath.Dir(encPath)),
 					zap.Error(err))
+				// Even if we failed this file, it won't be retried automatically; reduce pending count
+				st.FilesPending -= 1
+				status.SaveStatus(statusPath, st)
 				continue
 			}
 			if err := crypto.EncryptFile(key, f, encPath); err != nil {
@@ -153,27 +170,46 @@ func handleChanges(cfg *config.Config, key []byte, changedFiles []string) error 
 					zap.String("file", f),
 					zap.String("encrypted_path", encPath),
 					zap.Error(err))
+				st.FilesPending -= 1
+				status.SaveStatus(statusPath, st)
 				continue
 			}
 			logger.Info("File encrypted",
 				zap.String("file", f),
 				zap.String("encrypted", encPath))
+			st.FilesPending -= 1
+			status.SaveStatus(statusPath, st)
+		} else {
+			// If it's a directory, just decrement pending
+			st.FilesPending -= 1
+			status.SaveStatus(statusPath, st)
 		}
 	}
 
-	if err := gitutils.AddAndCommit(cfg.RepoPath, "Automated encrypted backup"); err != nil {
+	if err := gitutils.AddAndCommit(cfg.RepoPath, "Automated encrypted backup"); err == nil {
+		// If commit succeeded, get last commit hash
+		if hash, cerr := gitutils.GetLastCommitHash(cfg.RepoPath); cerr == nil {
+			st.LastCommitHash = hash
+			st.LastCommitTime = time.Now()
+		}
+		st.FilesPending = 0
+		status.SaveStatus(statusPath, st)
+	} else {
 		logger.Error("Git commit failed", zap.Error(err))
 		return errors.New("git commit failed; ensure you have a valid repo and permissions")
 	}
 
-	// Optionally push to remote
 	if cfg.RemoteURL != "" {
 		if err := gitutils.Push(cfg.RepoPath, "origin", "main"); err != nil {
 			logger.Error("Failed to push to remote", zap.String("remote_url", cfg.RemoteURL), zap.Error(err))
 			return errors.New("failed to push to remote repository; check your network or remote configuration")
+		} else {
+			st.LastPushSuccessful = true
+			st.LastPushTime = time.Now()
+			status.SaveStatus(statusPath, st)
+			logger.Info("Changes pushed to remote",
+				zap.String("remote_url", cfg.RemoteURL))
 		}
-		logger.Info("Changes pushed to remote",
-			zap.String("remote_url", cfg.RemoteURL))
 	}
 
 	return nil

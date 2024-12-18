@@ -2,6 +2,7 @@ package gitutils
 
 import (
 	"os/exec"
+	"strings"
 )
 
 // AddAndCommit runs `git add .` and `git commit -m "message"` in the given repo path.
@@ -25,4 +26,15 @@ func Push(repoPath, remote, branch string) error {
 	cmd := exec.Command("git", "push", remote, branch)
 	cmd.Dir = repoPath
 	return cmd.Run()
+}
+
+// GetLastCommitHash returns the latest commit hash in the given repository.
+func GetLastCommitHash(repoPath string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
