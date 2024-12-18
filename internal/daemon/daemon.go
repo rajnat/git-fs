@@ -1,4 +1,4 @@
-package main
+package daemon
 
 import (
 	"log"
@@ -15,40 +15,33 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// We'll keep some internal state
 type changeSet struct {
 	mu    sync.Mutex
 	files map[string]struct{}
 }
 
-func main() {
-	cfg, err := config.LoadConfig()
-	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
-	}
-
+// RunDaemon sets up the file watcher, encryption key, and handles file changes.
+func RunDaemon(cfg *config.Config) error {
 	// Derive the encryption key using a stable salt
-	// In a real scenario, you’d have stored the salt in the repo previously:
 	saltPath := filepath.Join(cfg.RepoPath, ".salt")
 	salt, err := fileutils.ReadOrCreateSalt(saltPath)
 	if err != nil {
-		log.Fatalf("Failed to get salt: %v", err)
+		return err
 	}
 
 	key, err := crypto.DeriveKey(cfg.Password, salt)
 	if err != nil {
-		log.Fatalf("Error deriving key: %v", err)
+		return err
 	}
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Fatalf("Error creating watcher: %v", err)
+		return err
 	}
 	defer watcher.Close()
 
-	err = watcher.Add(cfg.WatchPath)
-	if err != nil {
-		log.Fatalf("Error adding watch path: %v", err)
+	if err = watcher.Add(cfg.WatchPath); err != nil {
+		return err
 	}
 
 	cs := &changeSet{files: make(map[string]struct{})}
@@ -68,7 +61,7 @@ func main() {
 				if !ok {
 					return
 				}
-				// Track changes
+				// Track changes that matter
 				if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
 					cs.mu.Lock()
 					cs.files[event.Name] = struct{}{}
@@ -83,11 +76,11 @@ func main() {
 					debounce.Reset(2 * time.Second)
 				}
 
-			case err, ok := <-watcher.Errors:
+			case werr, ok := <-watcher.Errors:
 				if !ok {
 					return
 				}
-				log.Println("Watcher error:", err)
+				log.Println("Watcher error:", werr)
 			}
 		}
 	}()
@@ -95,7 +88,7 @@ func main() {
 	go func() {
 		for {
 			<-debounce.C
-			// Time to handle all changes accumulated
+			// Handle accumulated changes
 			cs.mu.Lock()
 			changedFiles := make([]string, 0, len(cs.files))
 			for f := range cs.files {
@@ -105,28 +98,22 @@ func main() {
 			cs.mu.Unlock()
 
 			if len(changedFiles) > 0 {
-				// Encrypt and commit changes
 				handleChanges(cfg, key, changedFiles)
 			}
 		}
 	}()
 
-	<-done // Keep the daemon running indefinitely
+	<-done     // Keep the daemon running indefinitely
+	return nil // This line won't be reached unless you signal done, but keeps compiler happy
 }
 
 func handleChanges(cfg *config.Config, key []byte, changedFiles []string) {
-	// Not all changed files might need encryption.
-	// We only encrypt files that are inside WATCH_PATH and not directories.
-	// Remove or handle deleted files as needed.
-
 	encryptedRoot := filepath.Join(cfg.RepoPath, ".encrypted")
 
 	for _, f := range changedFiles {
 		fileInfo, err := fileutils.SafeStat(f)
 		if err != nil {
-			// File might have been removed.
-			// Consider how to handle removals:
-			// If file is removed, we could also remove the encrypted version.
+			// File might have been removed - remove encrypted version if exists
 			encPath := encryptedFilePath(cfg, f, encryptedRoot)
 			if fileutils.FileExists(encPath) {
 				os.Remove(encPath)

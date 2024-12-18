@@ -1,13 +1,13 @@
-// cmd/daemon.go
 package cmd
 
 import (
 	"fmt"
-	"git-fs/internal/config"
 	"log"
 
+	"git-fs/internal/config"
+	"git-fs/internal/daemon"
+
 	"github.com/spf13/cobra"
-	// Add imports for watcher logic, fsnotify, etc.
 )
 
 var daemonCmd = &cobra.Command{
@@ -21,7 +21,10 @@ var daemonCmd = &cobra.Command{
 		}
 
 		fmt.Printf("Starting daemon. Repo: %s, Watch: %s\n", cfg.RepoPath, cfg.WatchPath)
-		// Implement watcher logic here.
+		err = daemon.RunDaemon(cfg)
+		if err != nil {
+			log.Fatalf("Failed to run daemon: %v", err)
+		}
 	},
 }
 
