@@ -1,13 +1,12 @@
 package cmd
 
 import (
-	"fmt"
-	"log"
-
 	"git-fs/internal/config"
 	"git-fs/internal/daemon"
+	"git-fs/internal/logging"
 
 	"github.com/spf13/cobra"
+	"go.uber.org/zap"
 )
 
 var daemonCmd = &cobra.Command{
@@ -15,15 +14,21 @@ var daemonCmd = &cobra.Command{
 	Short: "Start the watcher daemon",
 	Long:  `Runs in the background, watching the directory for changes and encrypting & committing them.`,
 	Run: func(cmd *cobra.Command, args []string) {
+		logger := logging.Logger
+
 		cfg, err := config.LoadConfig()
 		if err != nil {
-			log.Fatalf("Failed to load config: %v", err)
+			logger.Error("Failed to load config", zap.Error(err))
+			cmd.Println("Error: Could not load configuration. Please ensure config.yaml or ENV variables are set.")
+			return
 		}
 
-		fmt.Printf("Starting daemon. Repo: %s, Watch: %s\n", cfg.RepoPath, cfg.WatchPath)
-		err = daemon.RunDaemon(cfg)
-		if err != nil {
-			log.Fatalf("Failed to run daemon: %v", err)
+		logger.Info("Starting daemon", zap.String("repo", cfg.RepoPath), zap.String("watch", cfg.WatchPath))
+
+		if err := daemon.RunDaemon(cfg); err != nil {
+			logger.Error("Failed to run daemon", zap.Error(err))
+			cmd.Println("Error: Daemon failed to start. Check logs for details.")
+			return
 		}
 	},
 }

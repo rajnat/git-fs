@@ -1,7 +1,7 @@
 package daemon
 
 import (
-	"log"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -11,8 +11,10 @@ import (
 	"git-fs/internal/crypto"
 	fileutils "git-fs/internal/fileutil"
 	"git-fs/internal/gitutils"
+	"git-fs/internal/logging"
 
 	"github.com/fsnotify/fsnotify"
+	"go.uber.org/zap"
 )
 
 type changeSet struct {
@@ -20,33 +22,36 @@ type changeSet struct {
 	files map[string]struct{}
 }
 
-// RunDaemon sets up the file watcher, encryption key, and handles file changes.
 func RunDaemon(cfg *config.Config) error {
-	// Derive the encryption key using a stable salt
+	logger := logging.Logger
+
 	saltPath := filepath.Join(cfg.RepoPath, ".salt")
 	salt, err := fileutils.ReadOrCreateSalt(saltPath)
 	if err != nil {
-		return err
+		logger.Error("Failed to get or create salt", zap.String("path", saltPath), zap.Error(err))
+		return errors.New("could not initialize encryption salt; please check permissions or run `git-fs init` first")
 	}
 
 	key, err := crypto.DeriveKey(cfg.Password, salt)
 	if err != nil {
-		return err
+		logger.Error("Failed to derive key", zap.Error(err))
+		return errors.New("invalid password or salt; cannot derive encryption key")
 	}
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		return err
+		logger.Error("Failed to create watcher", zap.Error(err))
+		return errors.New("could not create file watcher")
 	}
 	defer watcher.Close()
 
 	if err = watcher.Add(cfg.WatchPath); err != nil {
-		return err
+		logger.Error("Failed to add watch path", zap.String("watchPath", cfg.WatchPath), zap.Error(err))
+		return errors.New("could not watch the specified directory; please check if it exists and is accessible")
 	}
 
 	cs := &changeSet{files: make(map[string]struct{})}
 
-	// Debounce mechanism:
 	debounce := time.NewTimer(0)
 	if !debounce.Stop() {
 		<-debounce.C
@@ -54,18 +59,20 @@ func RunDaemon(cfg *config.Config) error {
 
 	done := make(chan bool)
 
+	// Watcher goroutine
 	go func() {
 		for {
 			select {
 			case event, ok := <-watcher.Events:
 				if !ok {
+					logger.Info("Watcher events channel closed, stopping daemon.")
 					return
 				}
-				// Track changes that matter
 				if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
 					cs.mu.Lock()
 					cs.files[event.Name] = struct{}{}
 					cs.mu.Unlock()
+
 					// Reset the debounce timer
 					if !debounce.Stop() {
 						select {
@@ -78,17 +85,18 @@ func RunDaemon(cfg *config.Config) error {
 
 			case werr, ok := <-watcher.Errors:
 				if !ok {
+					logger.Warn("Watcher errors channel closed")
 					return
 				}
-				log.Println("Watcher error:", werr)
+				logger.Error("Watcher error occurred", zap.Error(werr))
 			}
 		}
 	}()
 
+	// Debounce goroutine
 	go func() {
 		for {
 			<-debounce.C
-			// Handle accumulated changes
 			cs.mu.Lock()
 			changedFiles := make([]string, 0, len(cs.files))
 			for f := range cs.files {
@@ -98,58 +106,83 @@ func RunDaemon(cfg *config.Config) error {
 			cs.mu.Unlock()
 
 			if len(changedFiles) > 0 {
-				handleChanges(cfg, key, changedFiles)
+				logger.Info("Processing changes", zap.Int("file_count", len(changedFiles)))
+				if err := handleChanges(cfg, key, changedFiles); err != nil {
+					logger.Error("Failed to handle changes", zap.Error(err))
+				}
 			}
 		}
 	}()
 
-	<-done     // Keep the daemon running indefinitely
-	return nil // This line won't be reached unless you signal done, but keeps compiler happy
+	<-done // This will block forever unless you have logic to close done
+	return nil
 }
 
-func handleChanges(cfg *config.Config, key []byte, changedFiles []string) {
+func handleChanges(cfg *config.Config, key []byte, changedFiles []string) error {
+	logger := logging.Logger
 	encryptedRoot := filepath.Join(cfg.RepoPath, ".encrypted")
 
 	for _, f := range changedFiles {
 		fileInfo, err := fileutils.SafeStat(f)
 		if err != nil {
-			// File might have been removed - remove encrypted version if exists
+			// File might have been removed
 			encPath := encryptedFilePath(cfg, f, encryptedRoot)
 			if fileutils.FileExists(encPath) {
-				os.Remove(encPath)
+				if removeErr := os.Remove(encPath); removeErr != nil {
+					logger.Warn("Failed to remove encrypted file for deleted plaintext",
+						zap.String("path", encPath), zap.Error(removeErr))
+				} else {
+					logger.Info("Removed encrypted file for deleted plaintext",
+						zap.String("path", encPath))
+				}
 			}
 			continue
 		}
+
 		if !fileInfo.IsDir() {
 			// Encrypt this file
 			encPath := encryptedFilePath(cfg, f, encryptedRoot)
 			if err := fileutils.EnsureDir(filepath.Dir(encPath)); err != nil {
-				log.Printf("Failed to ensure directory for %s: %v", encPath, err)
+				logger.Error("Failed to ensure directory",
+					zap.String("path", filepath.Dir(encPath)),
+					zap.Error(err))
 				continue
 			}
 			if err := crypto.EncryptFile(key, f, encPath); err != nil {
-				log.Printf("Failed to encrypt file %s: %v", f, err)
+				logger.Error("Failed to encrypt file",
+					zap.String("file", f),
+					zap.String("encrypted_path", encPath),
+					zap.Error(err))
 				continue
 			}
+			logger.Info("File encrypted",
+				zap.String("file", f),
+				zap.String("encrypted", encPath))
 		}
 	}
 
-	// Commit changes to git
 	if err := gitutils.AddAndCommit(cfg.RepoPath, "Automated encrypted backup"); err != nil {
-		log.Printf("Git commit failed: %v", err)
-	} else {
-		// Optionally push to remote if REMOTE_REPO is configured
-		if cfg.RemoteURL != "" {
-			if err := gitutils.Push(cfg.RepoPath, "origin", "main"); err != nil {
-				log.Printf("Failed to push: %v", err)
-			}
-		}
+		logger.Error("Git commit failed", zap.Error(err))
+		return errors.New("git commit failed; ensure you have a valid repo and permissions")
 	}
+
+	// Optionally push to remote
+	if cfg.RemoteURL != "" {
+		if err := gitutils.Push(cfg.RepoPath, "origin", "main"); err != nil {
+			logger.Error("Failed to push to remote", zap.String("remote_url", cfg.RemoteURL), zap.Error(err))
+			return errors.New("failed to push to remote repository; check your network or remote configuration")
+		}
+		logger.Info("Changes pushed to remote",
+			zap.String("remote_url", cfg.RemoteURL))
+	}
+
+	return nil
 }
 
 func encryptedFilePath(cfg *config.Config, filePath, encryptedRoot string) string {
 	rel, err := filepath.Rel(cfg.WatchPath, filePath)
 	if err != nil {
+		// If we cannot get relative path, fallback to a safe name
 		return filepath.Join(encryptedRoot, filepath.Base(filePath)+".enc")
 	}
 	return filepath.Join(encryptedRoot, rel+".enc")
