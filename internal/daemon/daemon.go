@@ -78,7 +78,6 @@ func RunDaemon(cfg *config.Config) error {
 
 	done := make(chan bool)
 
-	// Rest of the watcher implementation remains the same
 	go func() {
 		for {
 			select {
