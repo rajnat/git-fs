@@ -5,8 +5,7 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-// Logger is a global logger instance. In a larger project, you might avoid globals,
-// but for simplicity, we'll use a package-level variable.
+// Logger is a global logger instance. // TODO - this is a global variable, which is not ideal.
 var Logger *zap.Logger
 
 func InitLogger(debug bool) error {
