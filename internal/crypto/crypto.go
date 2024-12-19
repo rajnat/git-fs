@@ -4,66 +4,180 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"io"
 	"os"
 )
 
-// EncryptFile encrypts the file at `plaintextPath` and writes the result to `ciphertextPath`.
-func EncryptFile(key []byte, plaintextPath string, ciphertextPath string) error {
-	plaintext, err := os.ReadFile(plaintextPath)
-	if err != nil {
-		return err
+const (
+	NonceSize = 12 // Size for GCM nonce
+	KeySize   = 32 // Size for AES-256
+)
+
+// EncryptFileName encrypts a filename and returns the encrypted name plus nonces
+func EncryptFileName(key []byte, name string) (string, []byte, []byte, error) {
+	if len(key) != KeySize {
+		return "", nil, nil, errors.New("invalid key size")
 	}
 
+	// Generate nonces for filename and file content
+	fileNonce := make([]byte, NonceSize)
+	nameNonce := make([]byte, NonceSize)
+
+	if _, err := io.ReadFull(rand.Reader, fileNonce); err != nil {
+		return "", nil, nil, err
+	}
+	if _, err := io.ReadFull(rand.Reader, nameNonce); err != nil {
+		return "", nil, nil, err
+	}
+
+	// Create cipher block
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return err
+		return "", nil, nil, err
 	}
 
+	// Create GCM mode
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return err
+		return "", nil, nil, err
 	}
 
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
-		return err
-	}
+	// Encrypt the filename
+	encrypted := gcm.Seal(nil, nameNonce, []byte(name), nil)
 
-	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
+	// Encode to base64 for safe filename usage
+	encodedName := base64.URLEncoding.EncodeToString(encrypted)
 
-	return os.WriteFile(ciphertextPath, ciphertext, 0644)
+	return encodedName, fileNonce, nameNonce, nil
 }
 
-var ErrInvalidCiphertext = errors.New("invalid ciphertext")
+// EncryptFile encrypts file content using the provided key and nonce
+func EncryptFile(key []byte, content []byte, nonce []byte) ([]byte, error) {
+	if len(key) != KeySize {
+		return nil, errors.New("invalid key size")
+	}
+	if len(nonce) != NonceSize {
+		return nil, errors.New("invalid nonce size")
+	}
 
-// DecryptFile decrypts the file at `ciphertextPath` and writes the plaintext to `plaintextPath`.
-func DecryptFile(key []byte, ciphertextPath string, plaintextPath string) error {
-	ciphertext, err := os.ReadFile(ciphertextPath)
+	// Create cipher block
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create GCM mode
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	// Encrypt the content
+	encrypted := gcm.Seal(nil, nonce, content, nil)
+	return encrypted, nil
+}
+
+// Encrypt encrypts arbitrary data using AES-GCM
+func Encrypt(key []byte, data []byte) ([]byte, error) {
+	if len(key) != KeySize {
+		return nil, errors.New("invalid key size")
+	}
+
+	// Generate nonce
+	nonce := make([]byte, NonceSize)
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+
+	// Create cipher block
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create GCM mode
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	// Encrypt the data
+	encrypted := gcm.Seal(nil, nonce, data, nil)
+
+	// Prepend nonce to encrypted data
+	return append(nonce, encrypted...), nil
+}
+
+// DecryptFile decrypts a file and writes it to the destination path
+func DecryptFile(key []byte, sourcePath, destPath string) error {
+	// Read encrypted file
+	encryptedData, err := os.ReadFile(sourcePath)
 	if err != nil {
 		return err
 	}
 
+	if len(encryptedData) < NonceSize {
+		return errors.New("encrypted file too short")
+	}
+
+	// Extract nonce from the start of file
+	nonce := encryptedData[:NonceSize]
+	ciphertext := encryptedData[NonceSize:]
+
+	// Create cipher block
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return err
 	}
+
+	// Create GCM mode
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return err
 	}
 
-	if len(ciphertext) < gcm.NonceSize() {
-		return ErrInvalidCiphertext
-	}
-	nonce := ciphertext[:gcm.NonceSize()]
-	ciphertext = ciphertext[gcm.NonceSize():]
-
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	// Decrypt the file content
+	decrypted, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
 		return err
 	}
 
-	return os.WriteFile(plaintextPath, plaintext, 0644)
+	// Write decrypted content to destination
+	return os.WriteFile(destPath, decrypted, 0600)
+}
+
+// Decrypt decrypts data that was encrypted with Encrypt()
+func Decrypt(key []byte, data []byte) ([]byte, error) {
+	if len(key) != KeySize {
+		return nil, errors.New("invalid key size")
+	}
+	if len(data) < NonceSize {
+		return nil, errors.New("data too short")
+	}
+
+	// Extract nonce from the start of data
+	nonce := data[:NonceSize]
+	ciphertext := data[NonceSize:]
+
+	// Create cipher block
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create GCM mode
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	// Decrypt the data
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return plaintext, nil
 }

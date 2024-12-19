@@ -1,14 +1,18 @@
 package daemon
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+
 	"errors"
 	"os"
 	"path/filepath"
-	"sync"
+
 	"time"
 
 	"git-fs/internal/config"
 	"git-fs/internal/crypto"
+	filemetadata "git-fs/internal/filemetadata"
 	fileutils "git-fs/internal/fileutil"
 	"git-fs/internal/gitutils"
 	"git-fs/internal/logging"
@@ -18,9 +22,9 @@ import (
 	"go.uber.org/zap"
 )
 
-type changeSet struct {
-	mu    sync.Mutex
-	files map[string]struct{}
+func calculateHash(data []byte) string {
+	hash := sha256.Sum256(data)
+	return base64.StdEncoding.EncodeToString(hash[:])
 }
 
 func RunDaemon(cfg *config.Config) error {
@@ -39,6 +43,14 @@ func RunDaemon(cfg *config.Config) error {
 		return errors.New("invalid password or salt; cannot derive encryption key")
 	}
 
+	// Load or create metadata store
+	metadataPath := filepath.Join(cfg.RepoPath, ".metadata.enc")
+	metadataStore, err := filemetadata.LoadMetadataStore(metadataPath, key)
+	if err != nil {
+		logger.Error("Failed to load metadata store", zap.Error(err))
+		return errors.New("could not load metadata store")
+	}
+
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		logger.Error("Failed to create watcher", zap.Error(err))
@@ -50,13 +62,14 @@ func RunDaemon(cfg *config.Config) error {
 		logger.Error("Failed to add watch path", zap.String("watchPath", cfg.WatchPath), zap.Error(err))
 		return errors.New("could not watch the specified directory; please check if it exists and is accessible")
 	}
+
 	st := &status.Status{
 		WatcherRunning: true,
 	}
 	statusPath := filepath.Join(cfg.RepoPath, ".status.json")
 	status.SaveStatus(statusPath, st)
 
-	cs := &changeSet{files: make(map[string]struct{})}
+	cs := &filemetadata.ChangeSet{Files: make(map[string]struct{})}
 
 	debounce := time.NewTimer(0)
 	if !debounce.Stop() {
@@ -65,7 +78,7 @@ func RunDaemon(cfg *config.Config) error {
 
 	done := make(chan bool)
 
-	// Watcher goroutine
+	// Rest of the watcher implementation remains the same
 	go func() {
 		for {
 			select {
@@ -75,11 +88,10 @@ func RunDaemon(cfg *config.Config) error {
 					return
 				}
 				if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
-					cs.mu.Lock()
-					cs.files[event.Name] = struct{}{}
-					cs.mu.Unlock()
+					cs.Mu.Lock()
+					cs.Files[event.Name] = struct{}{}
+					cs.Mu.Unlock()
 
-					// Reset the debounce timer
 					if !debounce.Stop() {
 						select {
 						case <-debounce.C:
@@ -99,35 +111,36 @@ func RunDaemon(cfg *config.Config) error {
 		}
 	}()
 
-	// Debounce goroutine
+	// debounce goroutine to include metadata handling
 	go func() {
 		for {
 			<-debounce.C
-			cs.mu.Lock()
-			changedFiles := make([]string, 0, len(cs.files))
-			for f := range cs.files {
+			cs.Mu.Lock()
+			changedFiles := make([]string, 0, len(cs.Files))
+			for f := range cs.Files {
 				changedFiles = append(changedFiles, f)
 			}
-			cs.files = make(map[string]struct{})
-			cs.mu.Unlock()
+			cs.Files = make(map[string]struct{})
+			cs.Mu.Unlock()
 
 			if len(changedFiles) > 0 {
 				logger.Info("Processing changes", zap.Int("file_count", len(changedFiles)))
-				if err := handleChanges(cfg, key, changedFiles, st, statusPath); err != nil {
+				if err := handleChanges(cfg, key, changedFiles, st, statusPath, metadataStore, metadataPath); err != nil {
 					logger.Error("Failed to handle changes", zap.Error(err))
 				}
 			}
 		}
 	}()
 
-	<-done // This will block forever unless you have logic to close done
+	<-done
 	return nil
 }
 
-func handleChanges(cfg *config.Config, key []byte, changedFiles []string, st *status.Status, statusPath string) error {
+func handleChanges(cfg *config.Config, key []byte, changedFiles []string, st *status.Status,
+	statusPath string, metadataStore *filemetadata.MetadataStore, metadataPath string) error {
 	logger := logging.Logger
 	encryptedRoot := filepath.Join(cfg.RepoPath, ".encrypted")
-	// all changes have to be in pending before encryption -> commit -> push
+
 	st.FilesPending = len(changedFiles)
 	if err := status.SaveStatus(statusPath, st); err != nil {
 		logger.Warn("Failed to save status before encryption", zap.Error(err))
@@ -136,58 +149,121 @@ func handleChanges(cfg *config.Config, key []byte, changedFiles []string, st *st
 	for _, f := range changedFiles {
 		fileInfo, err := fileutils.SafeStat(f)
 		if err != nil {
-			// File might have been removed
-			encPath := encryptedFilePath(cfg, f, encryptedRoot)
-			if fileutils.FileExists(encPath) {
-				if removeErr := os.Remove(encPath); removeErr != nil {
-					logger.Warn("Failed to remove encrypted file for deleted plaintext",
-						zap.String("path", encPath), zap.Error(removeErr))
-				} else {
-					logger.Info("Removed encrypted file for deleted plaintext",
-						zap.String("path", encPath))
+			// Handle deleted files
+			relPath, _ := filepath.Rel(cfg.WatchPath, f)
+			metadataStore.Mu.Lock()
+			for encName, metadata := range metadataStore.Metadata {
+				if metadata.OriginalPath == relPath {
+					encPath := filepath.Join(encryptedRoot, encName)
+					if fileutils.FileExists(encPath) {
+						if removeErr := os.Remove(encPath); removeErr != nil {
+							logger.Warn("Failed to remove encrypted file",
+								zap.String("path", encPath), zap.Error(removeErr))
+						}
+					}
+					delete(metadataStore.Metadata, encName)
+					break
 				}
 			}
-			// Reduce pending since one file effectively doesn't need encryption now
-			st.FilesPending -= 1
+			metadataStore.Mu.Unlock()
+			st.FilesPending--
 			status.SaveStatus(statusPath, st)
 			continue
 		}
 
 		if !fileInfo.IsDir() {
-			// Encrypt this file
-			encPath := encryptedFilePath(cfg, f, encryptedRoot)
+			// Read file content
+			content, err := os.ReadFile(f)
+			if err != nil {
+				logger.Error("Failed to read file", zap.String("file", f), zap.Error(err))
+				st.FilesPending--
+				status.SaveStatus(statusPath, st)
+				continue
+			}
+
+			// Calculate original hash
+			originalHash := calculateHash(content)
+
+			// Generate encrypted filename
+			relPath, _ := filepath.Rel(cfg.WatchPath, f)
+			encryptedName, fileNonce, nameNonce, err := crypto.EncryptFileName(key, relPath)
+			if err != nil {
+				logger.Error("Failed to encrypt filename", zap.String("file", f), zap.Error(err))
+				st.FilesPending--
+				status.SaveStatus(statusPath, st)
+				continue
+			}
+
+			encPath := filepath.Join(encryptedRoot, encryptedName)
 			if err := fileutils.EnsureDir(filepath.Dir(encPath)); err != nil {
 				logger.Error("Failed to ensure directory",
 					zap.String("path", filepath.Dir(encPath)),
 					zap.Error(err))
-				// Even if we failed this file, it won't be retried automatically; reduce pending count
-				st.FilesPending -= 1
+				st.FilesPending--
 				status.SaveStatus(statusPath, st)
 				continue
 			}
-			if err := crypto.EncryptFile(key, f, encPath); err != nil {
+
+			// Encrypt file content
+			encryptedContent, err := crypto.EncryptFile(key, content, fileNonce)
+			if err != nil {
 				logger.Error("Failed to encrypt file",
 					zap.String("file", f),
 					zap.String("encrypted_path", encPath),
 					zap.Error(err))
-				st.FilesPending -= 1
+				st.FilesPending--
 				status.SaveStatus(statusPath, st)
 				continue
 			}
+
+			// Calculate encrypted hash
+			encryptedHash := calculateHash(encryptedContent)
+
+			// Save encrypted content
+			if err := os.WriteFile(encPath, encryptedContent, 0600); err != nil {
+				logger.Error("Failed to write encrypted file",
+					zap.String("path", encPath),
+					zap.Error(err))
+				st.FilesPending--
+				status.SaveStatus(statusPath, st)
+				continue
+			}
+
+			// Update metadata
+			metadata := filemetadata.FileMetadata{
+				EncryptedName:   encryptedName,
+				OriginalPath:    relPath,
+				OriginalHash:    originalHash,
+				EncryptedHash:   encryptedHash,
+				LastModified:    time.Now(),
+				FileSize:        fileInfo.Size(),
+				EncryptionNonce: nameNonce,
+				FileNonce:       fileNonce,
+			}
+
+			metadataStore.Mu.Lock()
+			metadataStore.Metadata[encryptedName] = metadata
+			metadataStore.Mu.Unlock()
+
 			logger.Info("File encrypted",
 				zap.String("file", f),
 				zap.String("encrypted", encPath))
-			st.FilesPending -= 1
+			st.FilesPending--
 			status.SaveStatus(statusPath, st)
 		} else {
-			// If it's a directory, just decrement pending
-			st.FilesPending -= 1
+			st.FilesPending--
 			status.SaveStatus(statusPath, st)
 		}
 	}
 
+	// Save metadata before git operations
+	if err := metadataStore.SaveToFile(metadataPath, key); err != nil {
+		logger.Error("Failed to save metadata", zap.Error(err))
+		return err
+	}
+
+	// Add both encrypted files and metadata to git
 	if err := gitutils.AddAndCommit(cfg.RepoPath, "Automated encrypted backup"); err == nil {
-		// If commit succeeded, get last commit hash
 		if hash, cerr := gitutils.GetLastCommitHash(cfg.RepoPath); cerr == nil {
 			st.LastCommitHash = hash
 			st.LastCommitTime = time.Now()
@@ -201,7 +277,9 @@ func handleChanges(cfg *config.Config, key []byte, changedFiles []string, st *st
 
 	if cfg.RemoteURL != "" {
 		if err := gitutils.Push(cfg.RepoPath, "origin", "main"); err != nil {
-			logger.Error("Failed to push to remote", zap.String("remote_url", cfg.RemoteURL), zap.Error(err))
+			logger.Error("Failed to push to remote",
+				zap.String("remote_url", cfg.RemoteURL),
+				zap.Error(err))
 			return errors.New("failed to push to remote repository; check your network or remote configuration")
 		} else {
 			st.LastPushSuccessful = true
@@ -213,13 +291,4 @@ func handleChanges(cfg *config.Config, key []byte, changedFiles []string, st *st
 	}
 
 	return nil
-}
-
-func encryptedFilePath(cfg *config.Config, filePath, encryptedRoot string) string {
-	rel, err := filepath.Rel(cfg.WatchPath, filePath)
-	if err != nil {
-		// If we cannot get relative path, fallback to a safe name
-		return filepath.Join(encryptedRoot, filepath.Base(filePath)+".enc")
-	}
-	return filepath.Join(encryptedRoot, rel+".enc")
 }

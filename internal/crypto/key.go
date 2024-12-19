@@ -7,10 +7,6 @@ import (
 	"golang.org/x/crypto/scrypt"
 )
 
-const (
-	KeySize = 32 // 256 bits
-)
-
 // DeriveKey uses scrypt to derive a key from a password.
 // The salt can be stored alongside encrypted files. It's not secret, but must be unique.
 func DeriveKey(password string, salt []byte) ([]byte, error) {

@@ -1,13 +1,12 @@
 package cmd
 
 import (
-	"path/filepath"
-	"strings"
-
 	"git-fs/internal/config"
 	"git-fs/internal/crypto"
+	filemetadata "git-fs/internal/filemetadata"
 	fileutils "git-fs/internal/fileutil"
 	"git-fs/internal/logging"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
@@ -42,42 +41,52 @@ var decryptCmd = &cobra.Command{
 			return
 		}
 
-		encryptedRoot := filepath.Join(cfg.RepoPath, ".encrypted")
-		files, err := fileutils.GetFiles(encryptedRoot)
+		// Load metadata store
+		metadataPath := filepath.Join(cfg.RepoPath, ".metadata.enc")
+		metadataStore, err := filemetadata.LoadMetadataStore(metadataPath, key)
 		if err != nil {
-			logger.Error("Error getting encrypted files", zap.String("encrypted_root", encryptedRoot), zap.Error(err))
-			cmd.PrintErrln("Error: Could not find encrypted files. Ensure your repository is correctly initialized and contains `.encrypted` directory.")
+			logger.Error("Failed to load metadata store", zap.Error(err))
+			cmd.PrintErrln("Error: Could not load metadata store. Ensure the file exists and the password is correct.")
 			return
 		}
 
-		for _, encFile := range files {
-			rel, _ := filepath.Rel(encryptedRoot, encFile)
-			plaintextRel := strings.TrimSuffix(rel, ".enc")
-			plaintextPath := filepath.Join(cfg.RepoPath, plaintextRel)
+		encryptedRoot := filepath.Join(cfg.RepoPath, ".encrypted")
 
-			if err := fileutils.EnsureDir(filepath.Dir(plaintextPath)); err != nil {
-				logger.Error("Failed to ensure directory",
-					zap.String("directory", filepath.Dir(plaintextPath)),
-					zap.Error(err))
-				cmd.PrintErrln("Error: Failed to create necessary directories for decrypted files. Check your file system permissions.")
-				return
+		// Process each file in the metadata store
+		for encryptedName, metadata := range metadataStore.Metadata {
+			encryptedPath := filepath.Join(encryptedRoot, encryptedName)
+
+			// Skip if encrypted file doesn't exist
+			if !fileutils.FileExists(encryptedPath) {
+				logger.Warn("Encrypted file not found",
+					zap.String("encrypted_path", encryptedPath))
+				continue
 			}
 
-			if err := crypto.DecryptFile(key, encFile, plaintextPath); err != nil {
-				logger.Error("Failed to decrypt file",
-					zap.String("encrypted_file", encFile),
-					zap.String("plaintext_path", plaintextPath),
+			// Create the output directory structure
+			outputPath := filepath.Join(cfg.WatchPath, metadata.OriginalPath)
+			if err := fileutils.EnsureDir(filepath.Dir(outputPath)); err != nil {
+				logger.Error("Failed to create directory",
+					zap.String("path", filepath.Dir(outputPath)),
 					zap.Error(err))
-				cmd.PrintErrln("Error: Failed to decrypt one or more files. Ensure the correct key and file integrity.")
-				return
+				continue
+			}
+
+			// Decrypt the file
+			if err := crypto.DecryptFile(key, encryptedPath, outputPath); err != nil {
+				logger.Error("Failed to decrypt file",
+					zap.String("encrypted_file", encryptedPath),
+					zap.String("output_path", outputPath),
+					zap.Error(err))
+				continue
 			}
 
 			logger.Info("File decrypted",
-				zap.String("encrypted_file", encFile),
-				zap.String("decrypted_file", plaintextPath))
+				zap.String("encrypted_file", encryptedPath),
+				zap.String("decrypted_file", outputPath))
 		}
 
-		logger.Info("Decryption complete", zap.String("repo_path", cfg.RepoPath))
+		logger.Info("Decryption complete", zap.String("watch_path", cfg.WatchPath))
 		cmd.Println("Decryption complete.")
 	},
 }
