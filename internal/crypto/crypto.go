@@ -1,6 +1,8 @@
 package crypto
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -14,6 +16,30 @@ const (
 	NonceSize = 12 // Size for GCM nonce
 	KeySize   = 32 // Size for AES-256
 )
+
+func Compress(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+
+	if _, err := gz.Write(data); err != nil {
+		return nil, err
+	}
+	if err := gz.Close(); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+func Decompress(data []byte) ([]byte, error) {
+	gz, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	defer gz.Close()
+
+	return io.ReadAll(gz)
+}
 
 // EncryptFileName encrypts a filename and returns the encrypted name plus nonces
 func EncryptFileName(key []byte, name string) (string, []byte, []byte, error) {
@@ -73,9 +99,14 @@ func EncryptFile(key []byte, content []byte, nonce []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Compress data
+	compressed, err := Compress(content)
+	if err != nil {
+		return nil, err
+	}
 
 	// Encrypt the content
-	encrypted := gcm.Seal(nil, nonce, content, nil)
+	encrypted := gcm.Seal(nil, nonce, compressed, nil)
 	return encrypted, nil
 }
 
@@ -144,8 +175,13 @@ func DecryptFile(key []byte, sourcePath, destPath string) error {
 		return err
 	}
 
+	// Decompress data
+	decompressed, err := Decompress(decrypted)
+	if err != nil {
+		return err
+	}
 	// Write decrypted content to destination
-	return os.WriteFile(destPath, decrypted, 0600)
+	return os.WriteFile(destPath, decompressed, 0600)
 }
 
 // Decrypt decrypts data that was encrypted with Encrypt()
